@@ -1,0 +1,2677 @@
+#!/bin/bash
+
+#
+# PJOB main script
+# Paul Moore <paul@paul-moore.com>
+#
+# (c) Copyright Paul Moore, 2022
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+_INCL_BASE=$(dirname $(echo $0 | sed -e 's,\(^[^\/]\),'"$(pwd)"'/\1,'))
+
+####
+# configuration
+
+. $_INCL_BASE/pjob.config
+
+####
+# pjob libraries
+
+. $_INCL_BASE/pjob-generic-functions
+
+####
+# functions
+
+#
+# helpers
+
+function exit_usage() {
+	msg "usage: $0 <command> [<options>]"
+	msg "pjob is a simple and flexible job scheduler"
+	cat $0 | sed -n 's/^#@//p'
+	msg ""
+	exit 0
+}
+
+function job_next() {
+	local i=1
+	while [[ -d $(job_dir $i) ]]; do
+		i=$(($i + 1))
+	done
+	echo $i
+}
+
+function job_dir() {
+	echo "$PJOB_DIR_JOBS/$1"
+}
+
+function id_valid() {
+	[[ -n $1 && -d $(job_dir $1) ]] && return 0
+	return 1
+}
+
+function id_ok_remove() {
+	local dir
+	dir=$(job_dir $1)
+
+	# can't remove running jobs
+	[[ $(cat $dir/status) == "trigger" ]] && return 1
+	[[ $(cat $dir/status) == "running" ]] && return 1
+
+	# check the flags
+	[[ -e $dir/flags/master ]] && return 1
+	[[ -e $dir/flags/persistent ]] && return 1
+
+	# can only remove triggered jobs if they are finished
+	[[ -e $dir/flags/trigger && $(cat $dir/status) != "finished" ]] && \
+		return 1
+
+	return 0
+}
+
+function id_ok_run() {
+	local dir
+	dir=$(job_dir $1)
+
+	# check the flags
+	[[ -e $dir/flags/disabled ]] && return 1
+	[[ -e $dir/flags/master ]] && return 1
+
+	# only allow a job to be re-run if it is persistent
+	[[ $(cat $dir/status) == "finished" && ! -e $dir/flags/persistent ]] \
+		&& return 1
+
+	return 0
+}
+
+function id_ok_kill() {
+	local dir
+	dir=$(job_dir $1)
+
+	# only remove running jobs
+	[[ $(cat $dir/status) != "running" ]] && return 1
+
+	return 0
+}
+
+function id_active() {
+	local dir
+	dir=$(job_dir $1)
+
+	[[ $(cat $dir/status) == "running" ]] && return 0
+	[[ $(cat $dir/status) == "remote" ]] && return 0
+
+	return 1
+}
+
+function host_resolve() {
+	local name
+
+	name="$1"
+
+	# sanity checks
+	if [[ -z $name ]]; then
+		echo ""
+		return
+	fi
+
+	# check the alias list
+	for i in $PJOB_HOSTS; do
+		local alias
+		local userhost
+		local host
+
+		alias=$(echo $i | cut -d',' -f 1)
+		userhost=$(echo $i | cut -d',' -f 2)
+		host=$(echo $userhost | cut -d'@' -f 2)
+
+		if [[ $name == $alias || $name == $host || $name == $userhost ]]; then
+			echo "$userhost"
+			return
+		fi
+	done
+
+	# no matches, assume it is a valid user@hostname
+	echo "$name"
+}
+
+function ipmi_cmd() {
+	local name
+
+	name="$1"
+	shift
+
+	# sanity checks
+	if [[ -z $name ]]; then
+		echo ""
+		return 1
+	fi
+
+	# check the alias list
+	for i in $PJOB_HOSTS_IPMI; do
+		local host
+		local ipmi
+		local user
+		local passwd
+
+		host=$(echo $i | cut -d',' -f 1)
+		ipmi=$(echo $i | cut -d',' -f 2)
+		user=$(echo $i | cut -d',' -f 3)
+		passwd=$(echo $i | cut -d',' -f 4)
+
+		if [[ $name == $host || $name == $ipmi ]]; then
+			local rc
+			ipmitool -I lanplus -H $ipmi -U $user -P $passwd \
+				$@
+			rc=$?
+			return $rc
+		fi
+	done
+
+	# no matches
+	return 1
+}
+
+function notify_email() {
+	local rc
+
+	local address="$1"
+	local subject="$2"
+	local body="$3"
+
+	# leave only the attachments in the argument list
+	shift 3
+
+	# sanity checks
+	[[ -z $address ]] && return 1
+	[[ -z $subject || ! -r $subject ]] && return 1
+	[[ -z $body || ! -r $body ]] && return 1
+
+	# send the notification via email
+	if [[ $# -gt 0 ]]; then
+		cat $body | \
+			mutt -e "set copy=no" \
+				-s "$(cat $subject)" -a $* -- $address
+		rc=$?
+	else
+		cat $body | \
+			mutt -e "set copy=no" -s "$(cat $subject)" $address
+		rc=$?
+	fi
+
+	return $rc
+}
+
+function remote_cmd() {
+	local rc
+	local host
+	local ssh_cmd
+	local args
+
+	# resolve the given remote host using our $PJOB_HOSTS db
+	host=$(host_resolve $1)
+	shift
+
+	# preserve the argument separation/quoting
+	args=""
+	for i in "$@"; do
+		args+=" \"$i\""
+	done
+
+	# TODO - verify if we need to enable systemd's linger option
+	# TODO - sort out the ssh options and setsid special handling
+
+	# get the ssh cmd
+	if [[ -n $PJOB_SSH ]]; then
+		ssh_cmd=$PJOB_SSH
+	else
+		ssh_cmd=$(which ssh 2> /dev/null)
+	fi
+	[[ ! -x $ssh_cmd ]] && exit_error "ssh is not installed"
+
+	# verify systemd's linger setting is enabled
+	$ssh_cmd $host < /dev/null -- 'which loginctl >& /dev/null'
+	if [[ $? -eq 0 ]]; then
+		local host_linger
+		host_linger=$($ssh_cmd $host < /dev/null -- 'loginctl show-user $(id -u -n) --property=Linger' | sed -e 's/Linger=//')
+		[[ $host_linger != "yes" ]] && \
+			exit_error "run 'loginctl enable-linger' on the remote host"
+	fi
+
+	# check if setsid accepts '-w'
+	local setsid_args=""
+	$ssh_cmd $host < /dev/null >& /dev/null -- 'setsid -w true' && setsid_args+="-w "
+
+	# find the pjob directory
+	local cmd
+	local dir
+	dir=$($ssh_cmd $host < /dev/null -- 'find ~/ -type d -name "pjob"')
+	cmd=$($ssh_cmd $host < /dev/null -- 'find $dir -type d -name "pjob"')
+	[[ -z $cmd ]] && exit_error "pjob not installed on the remote system"
+
+	# determine the ssh options and our use of setsid
+	local ssh_opts
+	local cmd_remote
+	case $1 in
+	config|edit|enter|debug|chroot|update)
+		ssh_opts="-t -o LogLevel=QUIET"
+		cmd_remote="cd $dir; ./pjob $args"
+		;;
+	watch|import|export)
+		ssh_opts=""
+		cmd_remote="cd $dir; ./pjob $args"
+		;;
+	*)
+		# defaults
+		ssh_opts="-t -o LogLevel=QUIET"
+		cmd_remote="cd $dir; setsid $setsid_args ./pjob $args"
+		;;
+	esac
+
+	# run the command
+	$ssh_cmd $ssh_opts $host -- "$cmd_remote"
+	rc=$?
+
+	return $rc
+}
+
+function status_update() {
+	local id
+	local file
+	local status=$2
+
+	# get the status file
+	if [[ -w $1 ]]; then
+		# file was passed directly
+		file=$1
+	elif [[ -w $(job_dir $1)/status ]]; then
+		# id was passed
+		file=$(job_dir $1)/status
+	else
+		# not working
+		return 1
+	fi
+
+	# update the status
+	case $status in
+	finished|new|remote|running|trigger)
+		echo $status > $file
+		;;
+	*)
+		# default
+		echo "unknown" > $file
+		;;
+	esac
+
+	return 0
+}
+
+#
+# commands
+
+#@
+#@job related commands:
+#@
+
+#@ new: create a new job
+#@   <num>: job id
+function job_new() {
+	local rc
+	local id
+	local dir
+	local chroot
+	local description
+	local machine=0
+
+	chroot=""
+	description=""
+
+	rc=0
+	id=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			[[ -z $id ]] && exit_error "invalid job ID"
+			[[ -d $(job_dir $id) ]] && \
+				exit_error "job #$id already exists"
+			;;
+		--chroot=*)
+			[[ -z $id ]] && exit_error "invalid job ID"
+
+			chroot=$(lopt_value "$1")
+			[[ -z $chroot || ! -d $PJOB_DIR_CHROOTS/$chroot ]] && \
+				exit_error "chroot does not exist"
+			;;
+		--description=*)
+			[[ -z $id ]] && exit_error "invalid job ID"
+
+			description=$(lopt_value "$1")
+			;;
+		--machine)
+			machine=1
+			;;
+		*)
+			exit_error "invalid new command"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# global write lock
+	(
+		flock -x 999 || exit 1
+
+		local rc
+
+		[[ $id -eq 0 ]] && id=$(job_next)
+		dir=$(job_dir $id)
+
+		if [[ ! -d $dir ]]; then
+			mkdir $dir
+			rc=$?
+			[[ $? -ne 0 ]] && \
+				exit_error "failed to create job #$id"
+
+			# job structure
+			touch $dir/status
+			status_update $id "new"
+			echo "$description" > $dir/description
+			mkdir $dir/config
+			echo $chroot > $dir/config/chroot
+			mkdir $dir/flags
+			mkdir $dir/data
+			touch $dir/data/job.sh
+			chmod a+x $dir/data/job.sh
+			mkdir $dir/trigger
+			touch $dir/trigger/trigger.sh
+			chmod a+x $dir/trigger/trigger.sh
+
+			if [[ $machine -eq 0 ]]; then
+				notice "created job #$id"
+			else
+				echo "$id"
+			fi
+		else
+			exit_error "job #$id already exists"
+		fi
+
+		exit $rc
+	) 999>$PJOB_DIR_JOBS/.lock
+	rc=$?
+
+	return $rc
+}
+
+#@ remove: delete an existing job
+#@   <num>: job id
+function job_remove() {
+	local rc
+	local id
+
+	[[ -z $1 ]] && exit_error "no job ID provided"
+
+	id=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			[[ -z $id ]] && exit_error "invalid job ID"
+			;;
+		*)
+			exit_error "invalid new command"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# global write lock
+	(
+		flock -x 999 || exit 1
+
+		local rc
+		local dir
+
+		id_valid $id || exit_error "job #$id does not exist"
+		dir=$(job_dir $id)
+
+		# job write lock
+		(
+			flock -x 999 || exit 1
+
+			local rc
+
+			id_ok_remove $id || \
+				exit_error "unable to remove job #$id"
+
+			rm -rf $dir
+			rc=$?
+			[[ $rc -eq 0 ]] && notice "removed job #$id"
+
+			exit $rc
+		) 998>$dir/.lock
+		rc=$?
+
+		exit $rc
+	) 999>$PJOB_DIR_JOBS/.lock
+	rc=$?
+
+	return $rc
+}
+
+#@ move: move an existing job to a new id
+#@   <num>: existing job id
+#@   <num>: new job id
+function job_move() {
+	local rc
+	local old
+	local new
+
+	rc=0
+	old=0
+	new=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			if [[ $old -eq 0 ]]; then
+				old=$1
+				id_valid $old || exit_error "invalid job #$old"
+			else
+				new=$1
+				[[ -z $new ]] && exit_error "invalid job ID"
+				[[ -d $(job_dir $new) ]] && \
+					exit_error "job #$new already exists"
+			fi
+			;;
+		*)
+			exit_error "invalid move command"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	[[ $old -eq 0 || $new -eq 0 ]] && exit_error "missing job IDs"
+
+	# global write lock
+	(
+		flock -x 999 || exit 1
+
+		id_valid $old || exit_error "invalid job #$old"
+		[[ -d $(job_dir $new) ]] && \
+			exit_error "job #$new already exists"
+
+		# job write lock
+		(
+			flock -x 998 || exit 1
+
+			local rc
+
+			mv $(job_dir $old) $(job_dir $new)
+			rc=$?
+			[[ $rc -eq 0 ]] && notice "moved job #$old to #$new"
+			exit $rc
+		) 998>$(job_dir $old)/.lock
+		exit $?
+	) 999>$PJOB_DIR_JOBS/.lock
+	rc=$?
+
+	return $rc
+}
+
+function remote_clone() {
+	local rc
+	local old_id
+	local old_dir
+	local new_host
+	local new_id
+
+	old_id=$1
+	new_host=$(echo $2 | cut -d':' -f 1)
+	new_id=$(echo $2 | cut -d':' -f 2)
+
+	# NOTE: locking the local job is left to the caller
+
+	# NOTE: we can't really lock the remote job during this process so
+	#       there is a small window for bad things to happen
+
+	# create the new remote job
+	local tmp=0
+	tmp=$(remote_cmd $new_host new --machine $new_id)
+	[[ $? -ne 0 ]] && exit_error "remote job clone failed"
+	if [[ -n $new_id ]]; then
+		[[ $new_id -ne $(echo $tmp | tr -d '\r') ]] && \
+			exit_error "remote job clone failed"
+	else
+		new_id=$(echo $tmp | tr -d '\r')
+	fi
+
+	old_dir=$(job_dir $old_id)
+	(cd $old_dir; tar zcf - config/ data/ description trigger/ vars/) | \
+		remote_cmd $new_host import --all=$new_id
+	rc=$?
+
+	# output the new job id on the remote system
+	echo "$new_id"
+
+	return $rc
+}
+
+#@ clone: clone an existing job to a new id
+#@   <num>: existing job id
+#@   <num>: new job id
+function job_clone() {
+	local rc
+	local old
+	local new
+
+	rc=0
+	old=0
+	new=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			if [[ $old -eq 0 ]]; then
+				old=$1
+				id_valid $old || exit_error "invalid job #$old"
+			else
+				new=$1
+				[[ -z $new ]] && exit_error "invalid job ID"
+				[[ -d $(job_dir $new) ]] && \
+					exit_error "job #$new already exists"
+			fi
+			;;
+		*:[0-9]*|*:)
+			if [[ $old -eq 0 ]]; then
+				exit_error "source job must be local"
+			else
+				local dir
+				local cid
+
+				new=$1
+				# read lock the local job and clone to remote
+				dir=$(job_dir $old)
+				(
+					flock -s 999 || exit 1
+					cid=$(remote_clone $old $new)
+				) 999>$dir/.lock
+				rc=$?
+				if [[ $rc -eq 0 ]]; then
+					notice "cloned job #$old to $(echo $new | cut -d':' -f 1):$cid"
+				fi
+
+				return $rc
+			fi
+			;;
+		*)
+			exit_error "invalid move command"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	[[ $old -eq 0 ]] && exit_error "missing job ID"
+
+	# global write lock
+	(
+		flock -x 999 || exit 1
+
+		id_valid $old || exit_error "invalid job #$old"
+		[[ $new -eq 0 ]] && new=$(job_next)
+		[[ -d $(job_dir $new) ]] && \
+			exit_error "job #$new already exists"
+
+		# job write lock
+		(
+			flock -x 998 || exit 1
+
+			local rc
+
+			# clone
+			cp -a $(job_dir $old) $(job_dir $new)
+			rc=$?
+			if [[ $rc -eq 0 ]]; then
+				local dir
+
+				dir=$(job_dir $new)
+
+				# reset the output and state
+				status_update $new "new"
+				rm -rf $dir/output/*
+
+				# reset the flags
+				rm -f $dir/flags/*
+
+				notice "cloned job #$old to #$new"
+			fi
+			exit $rc
+		) 998>$(job_dir $old)/.lock
+		exit $?
+	) 999>$PJOB_DIR_JOBS/.lock
+	rc=$?
+
+	return $rc
+}
+
+#@ list: list the jobs
+#@   --all: list the jobs on all hosts in $PJOB_HOSTS
+#@   --active: list only the active jobs
+function job_list() {
+	local rc=0
+	local all
+	local active
+
+	all=0
+	active=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--all)
+			all=1
+			;;
+		--active)
+			active=1
+			;;
+		*)
+			exit_error "invalid list option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	if [[ all -eq 0 ]]; then
+		# display only the local system
+
+		# global read lock
+		(
+			flock -s 999 || exit 1
+
+			local status
+			local flags
+			local description
+
+			# NOTE: we are not taking any job locks so to not block
+
+			[[ $active -eq 0 ]] && \
+				printf "%-5s %-10s %-16s %s\n" \
+					"ID" "STATUS" "FLAGS" "DESCRIPTION"
+			for id in $(ls -1 $PJOB_DIR_JOBS | sort -n); do
+				# status
+				status=$(cat $PJOB_DIR_JOBS/$id/status)
+
+				# flags
+				flags=""
+				for flag in $(ls -1 $PJOB_DIR_JOBS/$id/flags | sort -d); do
+					[[ -n $flags ]] && flags+=","
+					flags+="$(echo $flag | cut -c1 | awk '{ print toupper($0) }')"
+				done
+				[[ -z $flags ]] && flags="-"
+
+				# description
+				description=$(cat $PJOB_DIR_JOBS/$id/description | head -n 1)
+
+				if [[ $active -eq 0 ]] || id_active $id; then
+					printf "%-5s %-10s %-16s %s\n" \
+						"$id" "$status" "$flags" "$description"
+				fi
+			done
+			exit 0
+		) 999>$PJOB_DIR_JOBS/.lock
+		rc=$?
+	else
+		# display everyone in $PJOB_HOSTS
+		local name
+		local host
+
+		for i in $PJOB_HOSTS; do
+			name=$(echo "$i" | cut -d',' -f 1)
+			host=$(echo "$i" | cut -d',' -f 2 | cut -d'@' -f 2)
+			if ping -c 1 $host &> /dev/null; then
+				notice "SYSTEM: $name ($(host_resolve $name))"
+				remote_cmd $name list
+				[[ $? -ne 0 ]] && rc=1
+			fi
+		done
+	fi
+
+	return $rc
+}
+
+#@ flags: manage the flags of an existing job
+#@   <num>: existing job id
+#@   --set=<flag>: set <flag>
+#@   --unset=<flag>: unset <flag>
+function job_flags() {
+	local rc
+	local value
+	local id
+	local dir
+
+	rc=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--set=*)
+			value=$(echo $(lopt_value "$1") | awk '{ print tolower($0) }')
+			case $value in
+			disabled|master|notifications|persistent|remote|trigger|writable)
+				;;
+			*)
+				exit_error "invalid flag"
+				;;
+			esac
+
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				touch $PJOB_DIR_JOBS/$id/flags/$value
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		--unset=*)
+			value=$(echo $(lopt_value "$1") | awk '{ print tolower($0) }')
+			case $value in
+			disabled|master|notifications|persistent|remote|trigger|writable)
+				;;
+			*)
+				exit_error "invalid flag"
+				;;
+			esac
+
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				rm -f $PJOB_DIR_JOBS/$id/flags/$value
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		*)
+			exit_error "invalid flags option"
+			;;
+		esac
+		[[ $rc -ne 0 ]] && exit_error "flag operation failed"
+
+		# next
+		shift
+	done
+
+	return $rc
+}
+
+#@ edit: edit an existing job
+#@   <num>: job id
+#@   --chroot=<chroot>: set the chroot to <chroot>
+#@   --description[=<text>]: edit the description
+#@   --notify_email: edit the notification email address
+#@   --notify_email_filter_result: edit the email notification filter
+#@   --dispatch_hosts: edit the list of dispatch hosts
+#@   --job: edit the job script
+#@   --trigger: edit the trigger script
+function job_edit() {
+	local rc
+	local value
+	local id
+	local dir
+
+	rc=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--chroot=*)
+			local chroot
+
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+
+			chroot=$(lopt_value "$1")
+			[[ -z $chroot || ! -d $PJOB_DIR_CHROOTS/$chroot ]] && \
+				exit_error "chroot does not exist"
+
+			echo $chroot > $dir/config/chroot
+			;;
+		--description=*)
+			local description
+
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+
+			description=$(lopt_value "$1")
+			echo "$description" > $dir/description
+			;;
+		--description)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				editor $dir/description
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		--notify_email)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				editor $dir/config/notify_email
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		--notify_email_filter_result)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				editor $dir/config/notify_email_filter_result
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		--dispatch_hosts)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				editor $dir/config/dispatch_hosts
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		--job)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				editor $dir/data/job.sh
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		--trigger)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				editor $dir/trigger/trigger.sh
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		*)
+			exit_error "invalid edit option"
+			;;
+		esac
+		[[ $rc -ne 0 ]] && exit_error "edit operation failed"
+
+		# next
+		shift
+	done
+
+	return $rc
+}
+
+function job_notify() {
+	local rc
+	local id
+	local dir
+	local output
+	local address
+	local output_lines=20
+	local attach_files=""
+
+	# basic sanity checks
+	id="$1"
+	[[ -z $id ]] && return 1
+	dir=$(job_dir $id)
+	[[ ! -d $dir ]] && return 1
+	output=$dir/output
+
+	# notifications enabled?
+	[[ ! -e $dir/flags/notifications ]] && return 0
+
+	# check the notification filters
+	if [[ -r $dir/config/notify_email_filter_result ]]; then
+		case $(cat $dir/config/notify_email_filter_result) in
+		success)
+			[[ $(cat $output/output.rc) -ne 0 ]] && return 0
+			;;
+		failure)
+			[[ $(cat $output/output.rc) -eq 0 ]] && return 0
+			;;
+		all|*)
+			;;
+		esac
+	fi
+
+	# log the notification configuration
+	address=$(cat $dir/config/notify_email 2> /dev/null)
+	[[ -z $address ]] && return 0
+
+	# generate the subject
+	> $output/notify_email_subject.txt
+	echo "PJob $(hostname -f):$id [$(date --date="$(cat $output/time.start)" +"%m/%d/%Y %H:%M")]" \
+		> $output/notify_email_subject.txt
+
+	# generate the body
+	> $output/notify_email_body.txt
+	# header information
+	echo "SYSTEM: $(hostname -f)" >> $output/notify_email_body.txt
+	echo "DATE: $(date -R)" >> $output/notify_email_body.txt
+	echo "" >> $output/notify_email_body.txt
+	echo "JOB: $(cat $dir/description) ($id)" >> $output/notify_email_body.txt
+	echo "" >> $output/notify_email_body.txt
+	local job_result=$(cat $output/output.rc)
+	if [[ $job_result -eq 0 ]]; then
+		echo "RESULT: ok ($(cat $output/output.rc))" \
+			>> $output/notify_email_body.txt
+	else
+		echo "RESULT: failed ($(cat $output/output.rc))" \
+			>> $output/notify_email_body.txt
+	fi
+	time_delta=$(echo $(( ( $(date --date="$(cat $output/time.end)" +"%s") - $(date --date="$(cat $output/time.start)" +"%s") ) / 60 )) )
+	echo "STARTED: $(cat $output/time.start)" \
+		>> $output/notify_email_body.txt
+	echo "STOPPED: $(cat $output/time.end) ($time_delta minutes)" \
+		>> $output/notify_email_body.txt
+	echo "" >> $output/notify_email_body.txt
+	# job trigger
+	if [[ $(cat $output/trigger.log | wc -l) -gt 0 ]]; then
+		attach_files+=" $output/trigger.log"
+		echo "### START TRIGGER LAST $output_lines LINES" >> $output/notify_email_body.txt
+		tail -n $output_lines $output/trigger.log >> $output/notify_email_body.txt
+		echo "### END TRIGGER" >> $output/notify_email_body.txt
+		echo "" >> $output/notify_email_body.txt
+	fi
+	# job output
+	echo "### START OUTPUT LAST $output_lines LINES" >> $output/notify_email_body.txt
+	tail -n $output_lines $output/output.log >> $output/notify_email_body.txt
+	echo "### END OUTPUT" >> $output/notify_email_body.txt
+	echo "" >> $output/notify_email_body.txt
+
+	# send the email
+	notify_email $address \
+		$output/notify_email_subject.txt \
+		$output/notify_email_body.txt \
+		$output/output.log $attach_files
+	rc=$?
+
+	return $rc
+}
+
+#@ run: run an existing job
+#@   <num>: job id
+#@   --watch | -w: watch the output log
+#@   --nodecor: no header or footer decorations when watching the output
+function job_run() {
+	local rc
+	local id
+	local output
+	local cmd
+	local dir
+	local pid
+	local watch
+	local watch_opts
+
+	# NOTE: we only lock the job, and even then we only do it during exec
+
+	id=""
+	cmd="/pjob.data/job.sh"
+	watch=0
+	watch_opts=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--cmd=*)
+			cmd=$(lopt_value "$1")
+			;;
+		--watch|-w)
+			watch=1
+			;;
+		--nodecor)
+			watch_opts="--nodecor"
+			;;
+		*)
+			exit_error "invalid run option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# sanity checks
+	[[ -z $id ]] && exit_error "no job ID provided"
+	[[ ! -d $dir ]] && exit_error "job #$id does not exist"
+
+	# ok to run?
+	id_ok_run $id || exit_error "job #$id is disabled"
+
+	# reset the output directory
+	output=$dir/output
+	rm -rf $output
+	[[ $? -ne 0 ]] && exit_error "failed to reset the output directory"
+	mkdir $output
+	[[ $? -ne 0 ]] && exit_error "failed to reset the output directory"
+
+	# run the job in a sub-shell and return immediately
+	(
+		# job write lock
+		flock -x --nonblock 999
+		[[ $? -eq 1 ]] && exit_error "failed to lock job #$id"
+		status_update $id "running"
+
+		local rc
+
+		[[ ! -d $dir ]] && exit_error "job #$id no longer exists"
+
+		# init
+		> $output/time.start
+		> $output/time.end
+		> $output/output.log
+		> $output/output.rc
+
+		# reset the trigger log so we don't display old data
+		> $output/trigger.log
+
+		# create the job variables
+		[[ ! -d $dir/vars ]] && mkdir $dir/vars
+		if [[ -d $dir/vars ]]; then
+			[[ -f $dir/vars/hostinfo ]] && chmod u+w $dir/vars/hostinfo
+			> $dir/vars/hostinfo
+			echo "PJOB_VAR_HOST=$(hostname -f)" >> $dir/vars/hostinfo
+			echo "PJOB_VAR_JOB_ID=$id" >> $dir/vars/hostinfo
+			chmod 0444 $dir/vars/hostinfo
+		fi
+
+		# load the config
+		local chroot_opts=""
+		[[ -e $dir/flags/writable ]] && chroot_opts+=" -w"
+
+		# run
+		date -R > $output/time.start
+		$_INCL_BASE/pjob-chroot \
+			$chroot_opts -c $cmd $id >& $output/output.log
+		rc=$?
+		date -R > $output/time.end 2>/dev/null
+		echo "$rc" > $output/output.rc 2>/dev/null
+		status_update $id "finished" 2>/dev/null
+
+		# process the notifications
+		job_notify $id
+
+		exit $rc
+	) 999>$dir/.lock </dev/null &
+
+	# record the pid, disown the job, and exit
+	pid=$(jobs -r -p)
+	echo $pid > $output/pid
+	[[ -n $pid ]] && disown $pid
+
+	# watch the job if desired
+	if [[ $watch -eq 1 ]]; then
+		job_watch --id=$id $watch_opts -n 1000 -f
+	fi
+
+	return 0
+}
+
+#@ trigger: trigger an existing job
+#@   <num>: job id
+#@   -f: force a trigger
+function job_trigger() {
+	local rc
+	local id
+	local output
+	local cmd
+	local dir
+	local pid
+	local force
+
+	# NOTE: we only lock the job, and even then we only do it during exec
+
+	id=""
+	cmd="/pjob.data/job.sh"
+	force=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		-f)
+			force=1
+			;;
+		*)
+			exit_error "invalid run option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# sanity checks
+	[[ -z $id ]] && exit_error "no job ID provided"
+	[[ ! -d $dir ]] && exit_error "job #$id does not exist"
+
+	# ok to run as a triggered job?
+	if [[ $force -eq 0 ]]; then
+		[[ ! -e $dir/flags/trigger ]] && exit 1
+	fi
+	id_ok_run $id || exit 1
+
+	# ensure that the output directory is setup
+	output=$dir/output
+	[[ ! -d $output ]] && mkdir $output || /bin/true
+	[[ $? -ne 0 ]] && exit_error "failed to setup the output directory"
+
+	# run the job in a sub-shell and return immediately
+	(
+		# job write lock
+		flock -x --nonblock 999
+		[[ $? -eq 1 ]] && exit 1
+
+		[[ ! -d $dir ]] && exit_error "job #$id no longer exists"
+
+		local status_old
+
+		# init
+		> $output/trigger.start
+		> $output/trigger.log
+
+		# create the job variables
+		[[ ! -d $dir/vars ]] && mkdir $dir/vars
+		if [[ -d $dir/vars ]]; then
+			[[ -f $dir/vars/hostinfo ]] && chmod u+w $dir/vars/hostinfo
+			> $dir/vars/hostinfo
+			echo "PJOB_VAR_HOST=$(hostname -f)" >> $dir/vars/hostinfo
+			echo "PJOB_VAR_JOB_ID=$id" >> $dir/vars/hostinfo
+			chmod 0444 $dir/vars/hostinfo
+		fi
+
+		# trigger
+		status_old="$(cat $dir/status)"
+		status_update $id "trigger"
+		date -R > $output/trigger.start
+		if [[ $force -eq 0 ]]; then
+			$_INCL_BASE/pjob-chroot \
+				-c "/pjob.trigger/trigger.sh" $id >& $output/trigger.log
+			rc=$?
+		else
+			rc=0
+		fi
+		if [[ $rc -ne 0 ]]; then
+			status_update $id $status_old
+			exit 1
+		fi
+
+		# reset the output directory
+		rm -rf $output/{time.*,output.*}
+		[[ $? -ne 0 ]] && exit_error "failed to reset the output directory"
+
+		# should we dispatch this job?
+		if [[ -e $dir/flags/remote ]]; then
+			local dspflg=0
+			local target
+			local target_host
+			local target_user
+			local target_lock
+			local target_timeout
+
+			# we need a vars directory
+			[[ ! -d $dir/vars ]] && mkdir $dir/vars
+			[[ ! -d $dir/vars ]] && exit 1
+
+			# init
+			> $output/dispatch.log
+
+			# run the "should we dispatch?" hook
+			echo "PJOB_HOSTS_IPMI=\"$PJOB_HOSTS_IPMI\"" > $dir/vars/ipmiinfo
+			> $dir/vars/dispatchhosts
+			if [[ -r $dir/config/dispatch_hosts ]]; then
+				cat $dir/config/dispatch_hosts >> $dir/vars/dispatchhosts
+			fi
+			if [[ -e $dir/trigger/dispatch.sh ]]; then
+				notice "dispatch.sh" >> $output/dispatch.log
+				$_INCL_BASE/pjob-chroot \
+					-c "/pjob.trigger/dispatch.sh" $id >> $output/dispatch.log 2>&1
+				dspflg=$?
+			else
+				dspflg=1
+			fi
+			rm -f $dir/vars/dispatchhosts
+
+			# find the dispatch target host in the dispatch.log
+			target_host=""
+			if [[ $dspflg -eq 0 ]]; then
+				target_host="$(cat $output/dispatch.log | sed -n 's/^TARGET_HOST=\(.*\)/\1/p' | shuf | head -n 1)"
+				target_user="$(cat $output/dispatch.log | sed -n 's/^TARGET_USER=\(.*\)/\1/p')"
+				target_lock="$(cat $output/dispatch.log | sed -n 's/^TARGET_LOCK=\(.*\)/\1/p')"
+				target_timeout="$(cat $output/dispatch.log | sed -n 's/^TARGET_TIMEOUT=\(.*\)/\1/p')"
+
+				if [[ target_user != "" ]]; then
+					target=${target_user}@${target_host}
+				else
+					target=$target_host
+				fi
+			fi
+			[[ $target_host == "" || $target_host == "localhost" ]] && dspflg=1
+
+			# record some dispatch info
+			> $dir/vars/dispatchinfo
+			echo "PJOB_VAR_DISPATCH_SRC_HOST=$(hostname -f)" >> $dir/vars/dispatchinfo
+			echo "PJOB_VAR_DISPATCH_SRC_ID=$id" >> $dir/vars/dispatchinfo
+			echo "PJOB_VAR_DISPATCH_TGT_HOST=$target_host" >> $dir/vars/dispatchinfo
+
+			# run the dispatch "pre" hook
+			if [[ $dspflg -eq 0 && -e $dir/trigger/dispatch_pre.sh ]]; then
+				notice "dispatch_pre.sh" >> $output/dispatch.log
+				$_INCL_BASE/pjob-chroot \
+					-c "/pjob.trigger/dispatch_pre.sh" $id >> $output/dispatch.log 2>&1
+				dspflg=$?
+			fi
+
+			# attempt to lock the target
+			if [[ $target_lock -eq 1 ]]; then
+				notice "locking $target with $(hostname -f):$id for ${target_timeout}s" >> $output/dispatch.log
+				remote_cmd $target lock \
+					--owner="$(hostname -f):$id" \
+					--timeout="$target_timeout" >> $output/dispatch.log 2>&1
+				local lock_rc=$?
+				echo "RESULT (rc=$lock_rc)" >> $output/dispatch.log
+				[[ $lock_rc -ne 0 ]] && dspflg=1
+			fi
+
+			# do the dispatch (block if there is a "post" hook)
+			if [[ $dspflg -eq 0 ]]; then
+				local rc
+				local target_id
+				local block=1
+
+				# set the target keepalive
+				remote_cmd $target keepalive \
+					--timeout="$target_timeout" >> $output/dispatch.log 2>&1
+
+				# should we block on the remote job?
+				[[ -e $dir/trigger/dispatch_post.sh ]] && block=0
+
+				# clone the job to the target
+				target_id=$(remote_clone $id ${target}:)
+				[[ $? -ne 0 ]] && exit 1
+				remote_cmd $target edit $target_id \
+					--description="(dispatched) $(cat $dir/description | head -n 1)" >& /dev/null
+
+				# update the dispatch info with more information
+				echo "PJOB_VAR_DISPATCH_TGT_ID=$target_id" >> $dir/vars/dispatchinfo
+
+				if [[ $block -eq 0 ]]; then
+					# block
+
+					# carry over some flags to the remote
+					# NOTE: we send the notifications here
+					#       since we are blocking
+					local i
+					for i in writable; do
+						[[ -e $dir/flags/$i ]] &&
+							remote_cmd $target flags \
+								$target_id \
+								--set=$i >& /dev/null
+					done
+
+					# init
+					> $output/time.start
+					> $output/time.end
+					> $output/output.log
+					> $output/output.rc
+
+					# run the job
+					status_update $id "remote"
+					date -R > $output/time.start
+					remote_cmd $target run $target_id --nodecor -w >& $output/output.log
+					rc=$?
+					date -R > $output/time.end 2>/dev/null
+					echo "$rc" > $output/output.rc 2>/dev/null
+					status_update $id "finished"
+
+					# process the notifications
+					job_notify $id
+
+					# run the dispatch "post" hook
+					notice "dispatch_post.sh" >> $output/dispatch.log
+					$_INCL_BASE/pjob-chroot \
+						-c "/pjob.trigger/dispatch_post.sh" $id >> $output/dispatch.log 2>&1
+
+					# attempt to unlock the target
+					if [[ $target_lock -eq 1 ]]; then
+						remote_cmd $target unlock \
+							--owner="$(hostname -f):$id" &> /dev/null
+					fi
+				else
+					# do not block
+
+					# carry over some flags to the remote
+					local i
+					for i in notifications writable; do
+						[[ -e $dir/flags/$i ]] &&
+							remote_cmd $target flags \
+								$target_id \
+								--set=$i >& /dev/null
+					done
+
+					# run the job but do not block
+					status_update $id "remote"
+					remote_cmd $target run $target_id
+					rc=$?
+					status_update $id "finished"
+				fi
+
+				# don't execute the job locally
+				exit $rc
+			else
+				# no dispatch happened - cleanup
+				status_update $id $status_old
+				rm -f $dir/vars/dispatchinfo
+			fi
+		fi
+
+		# init
+		> $output/time.start
+		> $output/time.end
+		> $output/output.log
+		> $output/output.rc
+
+		# load the config
+		local chroot_opts=""
+		[[ -e $dir/flags/writable ]] && chroot_opts+=" -w"
+
+		# run
+		status_update $id "running"
+		date -R > $output/time.start
+		$_INCL_BASE/pjob-chroot $chroot_opts \
+			-c "/pjob.data/job.sh" $id >& $output/output.log
+		rc=$?
+		date -R > $output/time.end 2>/dev/null
+		echo "$rc" > $output/output.rc 2>/dev/null
+		status_update $id "finished" 2>/dev/null
+
+		# process the notifications
+		job_notify $id
+
+		exit $rc
+	) 999>$dir/.lock </dev/null &
+
+	# record the pid, disown the job, and exit
+	pid=$(jobs -r -p)
+	echo $pid > $output/pid
+	[[ -n $pid ]] && disown $pid
+
+	return 0
+}
+
+#@ kill: kill an existing job
+#@   <num>: job id
+function job_kill() {
+	local rc
+	local id
+	local dir
+
+	id=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		*)
+			exit_error "invalid kill option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# sanity checks
+	[[ -z $id ]] && exit_error "no job ID provided"
+	[[ ! -d $dir ]] && exit_error "job #$id does not exist"
+	id_ok_kill $id || exit_error "job #$id is not eligible to be killed"
+
+	# NOTE: we don't do any locking since the job is already locked/running
+	if [[ -r $dir/output/pid ]]; then
+		$_INCL_BASE/pjob-chroot-kill "$(cat $dir/output/pid)"
+		rc=$?
+	else
+		exit_error "no process info for job #$id"
+	fi
+
+	return $rc
+}
+
+#@ enter: enter an existing job interactively
+#@   <num>: job id
+function job_enter() {
+	local rc
+	local id
+	local cmd
+	local dir
+
+	# NOTE: we only lock the job, and even then we only do it during exec
+
+	id=""
+	cmd="/pjob.data/job-interactive.sh"
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--cmd=*)
+			cmd=$(lopt_value "$1")
+			;;
+		*)
+			exit_error "invalid enter option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# sanity checks
+	[[ -z $id ]] && exit_error "no job ID provided"
+	[[ ! -d $dir ]] && exit_error "job #$id does not exist"
+
+	# NOTE: we ignore the disabled flag
+
+	# NOTE: we don't clear the output directory
+
+	# run the job in debug mode
+	(
+		# job write lock
+		flock -x --nonblock 999
+		[[ $? -eq 1 ]] && exit_error "failed to lock job #$id"
+		status_update $id "running"
+
+		local rc
+
+		[[ ! -d $dir ]] && exit_error "job #$id no longer exists"
+
+		# create the job variables
+		[[ ! -d $dir/vars ]] && mkdir $dir/vars
+		if [[ -d $dir/vars ]]; then
+			[[ -f $dir/vars/hostinfo ]] && chmod u+w $dir/vars/hostinfo
+			> $dir/vars/hostinfo
+			echo "PJOB_VAR_HOST=$(hostname -f)" >> $dir/vars/hostinfo
+			echo "PJOB_VAR_JOB_ID=$id" >> $dir/vars/hostinfo
+			chmod 0444 $dir/vars/hostinfo
+		fi
+
+		# load the config
+		local chroot_opts=""
+		[[ -e $dir/flags/writable ]] && chroot_opts+=" -w"
+
+		# run
+		$_INCL_BASE/pjob-chroot $chroot_opts -c $cmd $id
+		rc=$?
+		status_update $id "finished"
+
+		exit $rc
+	) 999>$dir/.lock
+	rc=$?
+
+	return $rc
+}
+
+#@ debug: debug an existing job
+#@   <num>: job id
+function job_debug() {
+	local rc
+	local id
+	local cmd
+	local dir
+
+	# NOTE: we only lock the job, and even then we only do it during exec
+
+	id=""
+	cmd="/bin/bash"
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--cmd=*)
+			cmd=$(lopt_value "$1")
+			;;
+		*)
+			exit_error "invalid run option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# sanity checks
+	[[ -z $id ]] && exit_error "no job ID provided"
+	[[ ! -d $dir ]] && exit_error "job #$id does not exist"
+
+	# NOTE: we ignore the disabled flag
+
+	# NOTE: we don't clear the output directory
+
+	# run the job in debug mode
+	(
+		# job write lock
+		flock -x --nonblock 999
+		[[ $? -eq 1 ]] && exit_error "failed to lock job #$id"
+		status_update $id "running"
+
+		local rc
+
+		[[ ! -d $dir ]] && exit_error "job #$id no longer exists"
+
+		# create the job variables
+		[[ ! -d $dir/vars ]] && mkdir $dir/vars
+		if [[ -d $dir/vars ]]; then
+			[[ -f $dir/vars/hostinfo ]] && chmod u+w $dir/vars/hostinfo
+			> $dir/vars/hostinfo
+			echo "PJOB_VAR_HOST=$(hostname -f)" >> $dir/vars/hostinfo
+			echo "PJOB_VAR_JOB_ID=$id" >> $dir/vars/hostinfo
+			chmod 0444 $dir/vars/hostinfo
+		fi
+
+		# load the config
+		local chroot_opts=""
+		[[ -e $dir/flags/writable ]] && chroot_opts+=" -w"
+
+		# run
+		$_INCL_BASE/pjob-chroot $chroot_opts -c $cmd $id
+		rc=$?
+		status_update $id "finished"
+
+		exit $rc
+	) 999>$dir/.lock
+	rc=$?
+
+	return $rc
+}
+
+#@ watch: watch the output of an existing job
+#@   <num>: job id
+#@   --num=<lines> | -n <lines>: show the last <n> lines of output
+#@   --follow | -f: follow the job until it finishes
+#@   --nodecor: no header or footer decorations
+function job_watch() {
+	local rc
+	local id
+	local dir
+	local opt_n
+	local opt_f
+	local decor
+
+	# TODO - locking needed, if possible
+
+	id=""
+	opt_n=10
+	opt_f=""
+	decor=1
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--num=*)
+			id_valid $id || \
+				exit_error "job id not specified"
+			opt_n=$(lopt_value "$1")
+			;;
+		-n)
+			id_valid $id || \
+				exit_error "job id not specified"
+			opt_n=$2
+			shift
+			;;
+		--follow|-f)
+			id_valid $id || \
+				exit_error "job id not specified"
+			opt_f="-f"
+			;;
+		--nodecor)
+			decor=0
+			;;
+		*)
+			exit_error "invalid run option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	[[ ! -d $dir ]] && exit_error "invalid job #$id"
+
+	case "$(cat $dir/status)" in
+	new)
+		exit_error "job #$id has not started"
+		;;
+	running|remote)
+		if [[ -n $opt_f ]]; then
+			# start a sentinel to track the job lock
+			(
+				# block on the job lock
+				flock -x 999
+				/bin/true
+			) 999>$dir/.lock &
+			opt_f+=" --pid=$!"
+		fi
+
+		[[ $decor -eq 1 ]] && \
+			notice "job #$id started at $(cat $dir/output/time.start)"
+		tail -n $opt_n $opt_f $dir/output/output.log
+		if [[ -n $opt_f && $decor -eq 1 ]]; then
+			notice "job #$id exited with return value $(cat $dir/output/output.rc)"
+			notice "job #$id finished at $(cat $dir/output/time.end)"
+		fi
+		;;
+	trigger)
+		if [[ -n $opt_f ]]; then
+			# start a sentinel to track the job status
+			(
+				while [[ "$(cat $dir/status)" == "trigger" ]]; do
+					sleep 5
+				done
+			) &
+			opt_f+=" --pid=$!"
+		fi
+
+		[[ $decor -eq 1 ]] && \
+			notice "job #$id trigger start at $(cat $dir/output/trigger.start)"
+		if [[ -r $dir/output/dispatch.log ]]; then
+			tail -n $opt_n $opt_f $dir/output/trigger.log \
+				$dir/output/dispatch.log
+		else
+			tail -n $opt_n $opt_f $dir/output/trigger.log
+		fi
+		if [[ -n $opt_f && $decor -eq 1 ]]; then
+			notice "job #$id trigger finished"
+		fi
+		;;
+	finished)
+		str_time_start="UNKNOWN"
+		[[ -r $dir/output/time.start ]] && \
+			str_time_start="$(cat $dir/output/time.start)"
+		str_time_end="UNKNOWN"
+		[[ -r $dir/output/time.end ]] && \
+			str_time_end="$(cat $dir/output/time.end)"
+		str_output_rc="???"
+		[[ -r $dir/output/output.rc ]] && \
+			str_output_rc="$(cat $dir/output/output.rc)"
+
+		[[ $decor -eq 1 ]] && \
+			notice "job #$id started at $str_time_start"
+		if [[ -r $dir/output/output.log ]]; then
+			cat $dir/output/output.log
+		else
+			echo "NO OUTPUT"
+		fi
+		if [[ $decor -eq 1 ]]; then
+			notice "job #$id exited with return value $str_output_rc"
+			notice "job #$id finished at $str_time_end"
+		fi
+		;;
+	*)
+		exit_error "unknown job status"
+		;;
+	esac
+
+	return $rc
+}
+
+#@ zap: reset portions of the job
+#@   <num>: job id
+#@   --status: reset the status
+function job_zap() {
+	local rc
+	local value
+	local id
+	local dir
+
+	rc=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		[0-9]*)
+			id=$1
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--id=*)
+			id=$(lopt_value "$1")
+			dir=$(job_dir $id)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			;;
+		--status)
+			id_valid $id || \
+				exit_error "invalid, or unspecified job id"
+			# job write lock
+			(
+				flock -x 999 || exit 1
+				id_valid $id || \
+					exit_error "invalid, or unspecified job id"
+				status_update $id "new"
+				exit $?
+			) 999>$dir/.lock
+			rc=$?
+			;;
+		*)
+			exit_error "invalid zap option"
+			;;
+		esac
+		[[ $rc -ne 0 ]] && exit_error "zap operation failed"
+
+		# next
+		shift
+	done
+
+	return $rc
+}
+
+#@
+#@general commands:
+#@
+
+#@ config: manage the configuration
+#@   --global_config: manage the global pjob configuration
+#@   --global_dir: open a shell in the pjob.global directory
+function cmd_config() {
+	local rc
+	local value
+	local id
+	local dir
+
+	rc=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--global_config)
+			editor $_INCL_BASE/pjob.config
+			rc=$?
+			;;
+		--global_dir)
+			(cd $PJOB_DIR_GLOBAL; export PS1="[pjob.global]# "; /bin/sh)
+			rc=0
+			;;
+		*)
+			exit_error "invalid config option"
+			;;
+		esac
+		[[ $rc -ne 0 ]] && exit_error "config operation failed"
+
+		# next
+		shift
+	done
+
+	return $rc
+}
+
+#@ purge: purge old jobs
+function cmd_purge() {
+
+	# TODO - look into delayed purging
+
+	# global write lock
+	(
+		flock -x 999 || exit 1
+
+		local id
+		local dir
+
+		for id in $(cd $PJOB_DIR_JOBS; /bin/ls -1 | sort -n); do
+			dir=$(job_dir $id)
+
+			# job write lock
+			(
+				flock -x 999 || exit 1
+
+				# ensure the job still exists
+				[[ ! -d $dir ]] && exit 1
+
+				id_ok_remove $id || exit 1
+				[[ $(cat $dir/status) != "finished" ]] && \
+					exit 1
+
+				if [[ -n $PJOB_PURGE_DAYS ]]; then
+					[[ $(find $dir/output -name "time.*" -mtime +$PJOB_PURGE_DAYS | wc -l) -gt 0 ]] || exit 1
+				fi
+
+				rm -rf $dir
+				[[ $? -eq 0 ]] && notice "removed job #$id"
+			) 998>$dir/.lock
+		done
+	) 999>$PJOB_DIR_JOBS/.lock
+
+	return 0
+}
+
+#@ chroot: manage the chroots on the system
+#@   --list: list the available chroots
+#@   --manage=<chroot>: manage <chroot>
+function cmd_chroot() {
+	local rc
+
+	# TODO - this really should use locking
+
+	rc=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--list)
+			local dir
+			local name
+			local info
+
+			printf "%-30s %s\n" "CHROOT" "INFORMATION"
+			for name in $(ls -1 $PJOB_DIR_CHROOTS | sort -d); do
+				dir=$PJOB_DIR_CHROOTS/$name
+
+				# info
+				info="-"
+				if [[ -r $dir/etc/os-release ]]; then
+					info=$(. $dir/etc/os-release; echo $PRETTY_NAME)
+				elif [[ -r $dir/etc/lsb-release ]]; then
+					info=$(cat $dir/etc/lsb-release)
+				elif [[ -r $dir/etc/system-release ]]; then
+					info=$(cat $dir/etc/system-release)
+				elif [[ -r $dir/etc/redhat-release ]]; then
+					info=$(cat $dir/etc/redhat-release)
+				fi
+
+				printf "%-30s %s\n" "$name" "$info"
+			done
+			rc=0
+			;;
+		--manage=*)
+			local chroot
+
+			chroot=$(lopt_value "$1")
+			$_INCL_BASE/pjob-chroot -w -c /bin/bash $chroot
+			rc=$?
+			;;
+		*)
+			exit_error "invalid chroot option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	return $rc
+}
+
+#@ import: import data
+#@   --chroot=<chroot>: import a tar.gz from stdin to <chroot>
+#@   --job=<job>: import a tar.gz from stdin to <job>'s job
+#@   --trigger=<job>: import a tar.gz from stdin to the <job>'s trigger
+#@   --all=<job>: import a tar.gz from stdin to the <job>'s base directory
+#@   --restore=<job>: import a tar.gz from stdin to the <job>'s base directory
+function cmd_import() {
+	local rc
+
+	# TODO - this really should use locking
+
+	rc=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--chroot=*)
+			local dir
+			local chroot
+
+			chroot=$(lopt_value "$1")
+			dir=$PJOB_DIR_CHROOTS/$chroot
+
+			[[ ! -d $dir ]] && mkdir $dir || /bin/true
+			[[ $? -ne 0 ]] && exit_error "unable to create chroot"
+
+			tar zxf - --directory=$dir
+			rc=$?
+			;;
+		--job=*)
+			local dir
+			local id
+
+			id=$(lopt_value "$1")
+			id_valid $id || exit_error "invalid job #$id"
+
+			dir=$(job_dir $id)/data
+			[[ ! -d $dir ]] && exit_error "invalid job #$id"
+
+			tar zxf - --directory=$dir
+			rc=$?
+			;;
+		--trigger=*)
+			local dir
+			local id
+
+			id=$(lopt_value "$1")
+			id_valid $id || exit_error "invalid job #$id"
+
+			dir=$(job_dir $id)/trigger
+			[[ ! -d $dir ]] && exit_error "invalid job #$id"
+
+			tar zxf - --directory=$dir
+			rc=$?
+			;;
+		--all=*|--restore=*)
+			local dir
+			local id
+
+			id=$(lopt_value "$1")
+			id_valid $id || exit_error "invalid job #$id"
+
+			dir=$(job_dir $id)
+			[[ ! -d $dir ]] && exit_error "invalid job #$id"
+
+			tar zxf - --directory=$dir
+			rc=$?
+			;;
+		*)
+			exit_error "invalid import option"
+			;;
+		esac
+
+		#next
+		shift
+	done
+
+	return $rc
+}
+
+#@ export: export data
+#@   --chroot=<chroot>: export <chroot> as a tar.gz to stdout
+#@   --job=<job>: export <job>'s job as a tar.gz to stdout
+#@   --trigger=<job>: export <job>'s trigger as a tar.gz to stdout
+#@   --all=<job>: export <job>'s base directory as a tar.gz to stdout
+#@   --backup=<job>: backup <job> as a tar.gz to stdout
+function cmd_export() {
+	local rc
+
+	# TODO - this really should use locking
+
+	rc=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--chroot=*)
+			local dir
+			local chroot
+
+			chroot=$(lopt_value "$1")
+			dir=$PJOB_DIR_CHROOTS/$chroot
+
+			[[ ! -d $dir ]] && \
+				exit_error "chroot $chroot does not exist"
+
+			(cd $dir; tar zcf - .)
+			rc=$?
+			;;
+		--job=*)
+			local dir
+			local id
+
+			id=$(lopt_value "$1")
+			id_valid $id || exit_error "invalid job #$id"
+
+			dir=$(job_dir $id)/data
+			[[ ! -d $dir ]] && exit_error "invalid job #$id"
+
+			(cd $dir; tar zcf - .)
+			rc=$?
+			;;
+		--trigger=*)
+			local dir
+			local id
+
+			id=$(lopt_value "$1")
+			id_valid $id || exit_error "invalid job #$id"
+
+			dir=$(job_dir $id)/trigger
+			[[ ! -d $dir ]] && exit_error "invalid job #$id"
+
+			(cd $dir; tar zcf - .)
+			rc=$?
+			;;
+		--all=*)
+			local dir
+			local id
+
+			id=$(lopt_value "$1")
+			id_valid $id || exit_error "invalid job #$id"
+
+			dir=$(job_dir $id)
+			[[ ! -d $dir ]] && exit_error "invalid job #$id"
+
+			(cd $dir; tar zcf - .)
+			rc=$?
+			;;
+		--backup=*)
+			local dir
+			local id
+
+			id=$(lopt_value "$1")
+			id_valid $id || exit_error "invalid job #$id"
+
+			dir=$(job_dir $id)
+			[[ ! -d $dir ]] && exit_error "invalid job #$id"
+
+			(cd $dir; tar zcf - config/ data/ description flags/ trigger/)
+			rc=$?
+			;;
+		*)
+			exit_error "invalid export option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	return $rc
+}
+
+#@ lock: lock the job server
+#@   --owner=<string>: the lock owner string
+#@   --timeout=<seconds>: the lock timeout in seconds
+function cmd_lock() {
+	local rc=0
+	local lock
+	local owner
+	local timeout
+
+	# TODO: enforce the lock on certain operations (e.g. clone, run, etc.)
+
+	# lock file
+	lock=$PJOB_DIR_WORK/.pjob_lock
+
+	# defaults
+	owner=""
+	timeout=0
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--owner=*)
+			owner=$(lopt_value "$1")
+			;;
+		--timeout=*)
+			timeout=$(lopt_value "$1")
+			;;
+		*)
+			exit_error "invalid lock option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	[[ $owner == "" ]] && exit_error "invalid lock owner"
+
+	# lock the lock file
+	(
+		flock -n -x 999 || exit 1
+
+		if [[ -e $lock ]]; then
+			# check owner
+			if [[ "$owner" != "$(cat $lock | sed -n '1p')" ]]; then
+				# check timeout
+				[[ $(date "+%s") -le $(cat $lock | sed -n '2p') ]] && \
+					exit 1
+			fi
+		fi
+
+		# (re)take the lock
+		> $lock
+		echo "$owner" >> $lock
+		echo "$(( $(date "+%s") + $timeout ))" >> $lock
+
+		exit 0
+	) 999>$lock.lock
+	rc=$?
+
+	return $rc
+}
+
+#@ unlock: unlock the job server
+#@   --owner=<string>: the lock owner string
+function cmd_unlock() {
+	local rc=0
+	local lock
+	local owner
+
+	# lock file
+	lock=$PJOB_DIR_WORK/.pjob_lock
+
+	# defaults
+	owner=""
+	timeout=0
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--owner=*)
+			owner=$(lopt_value "$1")
+			;;
+		*)
+			exit_error "invalid lock option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# lock the lock file
+	[[ ! -e $lock ]] && return 0
+	(
+		flock -n -x 999 || exit 1
+
+		if [[ -e $lock ]]; then
+			# check the timeout
+			if [[ $(date "+%s") -gt $(cat $lock | sed -n '2p') ]]; then
+				rm -f $lock
+				exit 0
+			fi
+
+			# check owner
+			if [[ "$owner" == "" ]]; then
+				# forcibly unlock the lock when owner is empty
+				rm -f $lock
+				exit 0
+			fi
+			if [[ "$owner" == "$(cat $lock | sed -n '1p')" ]]; then
+				rm -f $lock
+				exit 0
+			fi
+		else
+			# no lock file
+			exit 0
+		fi
+
+		exit 1
+	) 999>$lock.lock
+	rc=$?
+
+	return $rc
+}
+
+#@ keepalive: adjust the pjob keepalive value
+#@   --timeout=<seconds>: the minimum keepalive in seconds
+function cmd_keepalive() {
+	local rc=0
+	local timeout
+	local kaf
+
+	# lock file
+	kaf=$PJOB_DIR_WORK/.pjob_keepalive
+
+	# defaults
+	timeout=0
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--timeout=*)
+			timeout=$(lopt_value "$1")
+			;;
+		*)
+			exit_error "invalid keepalive option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	[[ $timeout -le 0 ]] && exit_error "invalid timeout"
+
+	# lock the lock file
+	{
+		flock -n -x 999 || exit 1
+
+		local time_cur=0
+		local time_new
+
+		[[ -e $kaf ]] && time_cur=$(cat $kaf)
+		time_new=$(( $(date "+%s") + $timeout ))
+
+		[[ $time_new -le $time_cur ]] && exit 0
+
+		# adjust the timeout
+		echo "$time_new" > $kaf
+
+		exit 0
+	} 999>$kaf.lock
+	rc=$?
+
+	return $rc
+}
+
+#@ ipmi: manage systems via IPMI
+#@   <host>: system hostname or IPMI hostname
+#@   --power=status|on|off|cycle|reset|soft: IPMI power command
+function cmd_ipmi() {
+	local rc=0
+	local name
+	local power
+
+	name=""
+	power=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--power=*)
+			power=$(lopt_value "$1")
+			;;
+		*)
+			[[ $name != "" ]] && exit_error "multiple hosts not allowed"
+			# assume this is the hostname to lookup
+			name="$1"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# power
+	if [[ power != "" ]]; then
+		ipmi_cmd $name power $power
+		rc=$?
+	fi
+
+	return $rc
+}
+
+#@ update: update the pjob tool
+#@   --force: update the components even if they aren't already present
+#@   --core: update the core pjob tools
+#@   --systemd: update the pjob systemd unit file
+#@   --global: update the pjob global scripts
+#@   --all: update all of the pjob components
+function cmd_update() {
+	local rc=0
+	local force
+	local up_core
+	local up_systemd
+	local up_global
+
+	force=0
+	up_core=0
+	up_systemd=0
+	up_global=0
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--force)
+			force=1
+			;;
+		--core)
+			up_core=1
+			;;
+		--systemd)
+			up_systemd=1
+			;;
+		--global)
+			up_global=1
+			;;
+		--all)
+			up_core=1
+			up_systemd=1
+			up_global=1
+			;;
+		*)
+			exit_error "invalid update option"
+			;;
+		esac
+
+		# next
+		shift
+	done
+
+	# NOTE: we always want to do "core" first if selected
+
+	# core
+	if [[ $up_core -eq 1 ]]; then
+		# treat all errors here as fatal since others may rely on it
+		git pull || exit_error "updating the core failed"
+	fi
+
+	# systemd
+	if [[ $up_systemd -eq 1 ]]; then
+		# TODO: query systemd to determine location of local unit files
+		if [[ -r /etc/systemd/system/pjob.service || $force -eq 1 ]]; then
+			cp $_INCL_BASE/pjob.service \
+				/etc/systemd/system/pjob.service
+			[[ $? -ne 0 ]] && rc=1
+			systemctl daemon-reload
+		else
+			warning "pjob unit file is not installed"
+			rc=1
+		fi
+	fi
+
+	# global
+	if [[ $up_global -eq 1 ]]; then
+		for i in $(ls $_INCL_BASE/global.contrib); do
+			if [[ -r $PJOB_DIR_GLOBAL/$i || $force -eq 1 ]]; then
+				cp $_INCL_BASE/global.contrib/$i \
+					$PJOB_DIR_GLOBAL
+				[[ $? -ne 0 ]] && rc=1
+			else
+				warning "global file $i is not installed"
+				rc=1
+			fi
+		done
+	fi
+
+	return $rc
+}
+
+####
+# main
+
+rc=0
+
+#
+# dependency checks
+
+# TODO - although we should be careful about local vs remote
+
+#
+# option parsing
+
+# defaults
+opt_host=""
+
+while getopts ":hH:" opt; do
+	case "$opt" in
+	H)
+		opt_host+=" $OPTARG"
+		;;
+	h|?)
+		exit_usage
+		;;
+	esac
+done
+shift $(($OPTIND - 1));
+
+#
+# configuration checks
+
+# defer until we know if we are running locally or remote
+
+#
+# command handling
+
+if [[ -n $opt_host ]]; then
+	# remote
+
+	# sanity check
+	[[ -z $opt_host ]] && exit_error "host not specified"
+
+	# do any command fixup necessary and issue the remote command
+	case $1 in
+	*)
+		for host in $opt_host; do
+			[[ $(echo "$opt_host" | awk '{print NF}') -gt 1 ]] && \
+				notice "HOST: $host"
+			remote_cmd $host "$@"
+			rc_tmp=$?
+			[[ $rc_tmp -ne 0 ]] && rc=$rc_tmp
+		done
+		;;
+	esac
+else
+	# local
+
+	# verify pjob directory structure
+	[[ ! -d $PJOB_DIR_CHROOTS ]] && \
+		exit_error "invalid PJOB_DIR_CHROOTS directory"
+	[[ ! -d $PJOB_DIR_JOBS ]] && \
+		exit_error "invalid PJOB_DIR_JOBS directory"
+	[[ ! -d $PJOB_DIR_WORK ]] && \
+		exit_error "invalid PJOB_DIR_WORK directory"
+
+	# command processing
+	cmd=$1
+	shift 1
+	case $cmd in
+	# job commands
+	new)
+		job_new "$@"
+		rc=$?
+		;;
+	remove)
+		job_remove "$@"
+		rc=$?
+		;;
+	move)
+		job_move "$@"
+		rc=$?
+		;;
+	clone)
+		job_clone "$@"
+		rc=$?
+		;;
+	list)
+		job_list "$@"
+		rc=$?
+		;;
+	flags)
+		job_flags "$@"
+		rc=$?
+		;;
+	edit)
+		job_edit "$@"
+		rc=$?
+		;;
+	run)
+		job_run "$@"
+		rc=$?
+		;;
+	kill)
+		job_kill "$@"
+		rc=$?
+		;;
+	watch)
+		job_watch "$@"
+		rc=$?
+		;;
+	trigger)
+		job_trigger "$@"
+		rc=$?
+		;;
+	enter)
+		job_enter "$@"
+		rc=$?
+		;;
+	debug)
+		job_debug "$@"
+		rc=$?
+		;;
+	zap)
+		job_zap "$@"
+		rc=$?
+		;;
+	# global commands
+	config)
+		cmd_config "$@"
+		rc=$?
+		;;
+	purge)
+		cmd_purge "$@"
+		rc=$?
+		;;
+	chroot)
+		cmd_chroot "$@"
+		rc=$?
+		;;
+	import)
+		cmd_import "$@"
+		rc=$?
+		;;
+	export)
+		cmd_export "$@"
+		rc=$?
+		;;
+	lock)
+		cmd_lock "$@"
+		rc=$?
+		;;
+	unlock)
+		cmd_unlock "$@"
+		rc=$?
+		;;
+	keepalive)
+		cmd_keepalive "$@"
+		rc=$?
+		;;
+	ipmi)
+		cmd_ipmi "$@"
+		rc=$?
+		;;
+	update)
+		cmd_update "$@"
+		rc=$?
+		;;
+	*)
+		exit_usage
+		rc=$?
+		;;
+	esac
+fi
+
+#
+# cleanup
+
+exit $rc
+
+# kate: syntax bash;

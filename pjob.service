@@ -1,0 +1,11 @@
+[Unit]
+Description=PJOB Service
+
+[Service]
+ExecStart=/root/sources/pjob/pjob-service
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+

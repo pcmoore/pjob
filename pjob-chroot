@@ -1,0 +1,198 @@
+#!/bin/bash
+
+#
+# PJOB chroot script
+# Paul Moore <paul@paul-moore.com>
+#
+# (c) Copyright Paul Moore, 2022
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# NOTE: the pjob-chroot and pjob-chroot-kill scripts must be kept in sync
+
+_INCL_BASE=$(dirname $(echo $0 | sed -e 's,\(^[^\/]\),'"$(pwd)"'/\1,'))
+
+####
+# configuration
+
+. $_INCL_BASE/pjob.config
+
+####
+# pjob libraries
+
+. $_INCL_BASE/pjob-generic-functions
+
+####
+# trap/error handler
+
+trap_dirs=""
+
+trap trap_handler 1 2 3 15
+
+function cleanup() {
+	for i in $trap_dirs; do
+		sudo /bin/umount --lazy --recursive $i
+	done
+	trap_dirs=""
+}
+
+function trap_handler() {
+	for i in $trap_dirs; do
+		sudo /bin/umount --lazy --recursive $i
+	done
+	trap_dirs=""
+	exit 3
+}
+
+####
+# functions
+
+function exit_usage() {
+	msg "$0: ..."
+	exit 1
+}
+
+####
+# main
+
+# verify script dependencies
+verify_deps sudo
+verify_deps mount
+verify_deps umount
+verify_deps chroot
+
+#
+# option parsing
+#
+
+opt_write="ro"
+opt_exec="true"
+
+while getopts ":hwc:" opt; do
+	case "$opt" in
+	w)
+		opt_write="rw"
+		;;
+	c)
+		opt_exec="$OPTARG"
+		;;
+	h|?)
+		exit_usage
+		;;
+	esac
+done
+
+shift $(($OPTIND - 1));
+if [[ -n $1 && -d $PJOB_DIR_CHROOTS/$1 ]]; then
+	id=0
+	chroot_name=$1
+	work_dir=$PJOB_DIR_CHROOTS/.$chroot_name
+elif [[ -n $1 && -r $PJOB_DIR_JOBS/$1/config/chroot ]]; then
+	id=$1
+	chroot_name=$(cat $PJOB_DIR_JOBS/$id/config/chroot)
+	work_dir=$PJOB_DIR_WORK/$id
+else
+	exit_error "invalid job ID or chroot"
+fi
+shift
+
+#
+# sanity checks
+
+[[ $chroot_name == "" ]] && exit_error "invalid job ID or chroot"
+
+#
+# chroot
+
+# make sure the working directory exists
+[[ ! -d $work_dir ]] && mkdir $work_dir
+[[ ! -d $work_dir ]] && exit_error "unable to create the working directory"
+
+# find the unshare binary
+unshare_bin=$(which unshare 2> /dev/null)
+[[ $? -ne 0 ]] && exit_error "unable to find the unshare application"
+
+# find the chroot binary
+chroot_bin=$(which chroot 2> /dev/null)
+[[ $? -ne 0 ]] && exit_error "unable to find the chroot application"
+
+# mount the chroot
+sudo /bin/mount -o bind,$opt_write \
+	$PJOB_DIR_CHROOTS/$chroot_name $work_dir
+[[ $? -ne 0 ]] && exit_error "unable to mount the chroot base"
+trap_dirs="$work_dir $trap_dirs"
+sudo /bin/mount --make-slave $work_dir
+[[ $? -ne 0 ]] && exit_error "unable to configure the chroot base"
+
+# mount the global directory
+if [[ $id -ne 0 && -d $PJOB_DIR_GLOBAL ]]; then
+	sudo /bin/mount -o bind,ro \
+		$PJOB_DIR_GLOBAL $work_dir/pjob.global
+	[[ $? -ne 0 ]] && exit_error "unable to mount the global directory"
+	trap_dirs="$work_dir/pjob.global $trap_dirs"
+fi
+
+# mount the vars directory
+if [[ $id -ne 0 ]]; then
+	sudo /bin/mount -o bind,ro \
+		$PJOB_DIR_JOBS/$id/vars $work_dir/pjob.vars
+	[[ $? -ne 0 ]] && exit_error "unable to mount the vars directory"
+	trap_dirs="$work_dir/pjob.vars $trap_dirs"
+fi
+
+# mount the data directory
+if [[ $id -ne 0 ]]; then
+	sudo /bin/mount -o bind,rw \
+		$PJOB_DIR_JOBS/$id/data $work_dir/pjob.data
+	[[ $? -ne 0 ]] && exit_error "unable to mount the data directory"
+	trap_dirs="$work_dir/pjob.data $trap_dirs"
+fi
+
+#  mount the trigger directory
+if [[ $id -ne 0 ]]; then
+	sudo /bin/mount -o bind,rw \
+		$PJOB_DIR_JOBS/$id/trigger $work_dir/pjob.trigger
+	[[ $? -ne 0 ]] && exit_error "unable to mount the trigger directory"
+	trap_dirs="$work_dir/pjob.trigger $trap_dirs"
+fi
+
+# mount /proc
+sudo /bin/mount -t proc none $work_dir/proc
+[[ $? -ne 0 ]] && exit_error "unable to mount /proc in the chroot"
+trap_dirs="$work_dir/proc $trap_dirs"
+
+# bind mount the system directories
+for i in /dev /sys; do
+	sudo /bin/mount -o bind $i $work_dir/$i
+	[[ $? -ne 0 ]] && exit_error "unable to mount $i in the chroot"
+	trap_dirs="$work_dir/$i $trap_dirs"
+done
+
+# see what unshare supports
+unshare_opts="-f --pid --mount-proc=$work_dir/proc"
+$unshare_bin --kill-child -- /bin/true >& /dev/null
+[[ $? -eq 0 ]] && unshare_opts+=" --kill-child"
+
+# do the chroot
+sudo $unshare_bin $unshare_opts -- $chroot_bin -- $work_dir $opt_exec
+rc=$?
+
+# undo the mounts and cleanup
+sleep 1
+cleanup
+
+# exit
+exit $rc
+
+# kate: syntax bash;

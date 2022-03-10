@@ -1,0 +1,141 @@
+#!/bin/bash
+
+#
+# PJOB service script
+# Paul Moore <paul@paul-moore.com>
+#
+# (c) Copyright Paul Moore, 2022
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+_INCL_BASE=$(dirname $(echo $0 | sed -e 's,\(^[^\/]\),'"$(pwd)"'/\1,'))
+
+####
+# configuration
+
+. $_INCL_BASE/pjob.config
+
+####
+# pjob libraries
+
+. $_INCL_BASE/pjob-generic-functions
+
+####
+# functions
+
+function exit_usage() {
+	msg "$0: ..."
+	exit 1
+}
+
+function svc_purge() {
+	$_INCL_BASE/pjob purge
+}
+
+function svc_trigger() {
+	local id
+
+	for id in $(cd $PJOB_DIR_JOBS; /bin/ls -1 | sort -n); do
+		$_INCL_BASE/pjob trigger --id=$id
+	done
+
+	return 0
+}
+
+function svc_keepalive_check() {
+	# skip if keepalives are not enabled
+	[[ ! -e $kaf ]] && return 0
+
+	# lock the lock file
+	{
+		flock -n -x 999 || exit
+
+		# time to shutdown?
+		if [[ $(date "+%s") -gt $(cat $kaf) ]]; then
+			shutdown -h now "pjob keepalive expired"
+		fi
+	} 999>$kaf.lock
+
+	return 0
+}
+
+####
+# main
+
+# verify script dependencies
+
+# TODO
+
+#
+# option parsing
+#
+
+while getopts ":h" opt; do
+	case "$opt" in
+	h|?)
+		exit_usage
+		;;
+	esac
+done
+
+#
+# sanity checks
+
+#
+# initialize the keepalive (if enabled)
+
+kaf=$PJOB_DIR_WORK/.pjob_keepalive
+
+if [[ $PJOB_SVC_KEEPALIVE -gt 0 ]]; then
+	# reset the keepalive
+	echo "$(( $(date "+%s") + $PJOB_SVC_KEEPALIVE ))" > $kaf
+else
+	# clean the keepalive
+	rm -f $kaf
+fi
+
+#
+# job processing loop
+
+while /bin/true; do
+	#
+	# reload the config to catch changes
+
+	. $_INCL_BASE/pjob.config
+
+	#
+	# purge any old jobs
+
+	svc_purge
+
+	#
+	# check the keepalive expiration
+
+	svc_keepalive_check
+
+	#
+	# process any trigger jobs
+
+	svc_trigger
+
+	#
+	# sleep and go again
+
+	sleep $PJOB_SVC_SLEEP
+done
+
+# exit
+exit 0
+
+# kate: syntax bash;

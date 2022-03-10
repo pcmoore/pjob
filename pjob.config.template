@@ -1,0 +1,33 @@
+#
+# PJOB configuration
+#
+
+# TODO - add some documentation to this file
+
+####
+# core configuration
+
+PJOB_DIR_JOBS="/srv/pjob/jobs"
+PJOB_DIR_GLOBAL="/srv/pjob/global"
+PJOB_DIR_CHROOTS="/var/lib/pjob/chroots"
+PJOB_DIR_WORK="/var/cache/pjob/work"
+
+PJOB_SVC_SLEEP=300
+PJOB_SVC_KEEPALIVE=0
+
+PJOB_PURGE_DAYS=7
+
+PJOB_HOSTS=""
+PJOB_HOSTS+=""
+
+PJOB_HOSTS_IPMI=""
+PJOB_HOSTS_IPMI+=""
+
+PJOB_SSH=""
+
+####
+# commands
+
+# TODO - document loading ssh keys here
+
+# kate: syntax bash;

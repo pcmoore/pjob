@@ -1,0 +1,92 @@
+#!/bin/bash
+
+#
+# PJOB generic library
+# Paul Moore <paul@paul-moore.com>
+#
+# (c) Copyright Paul Moore, 2022
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+####
+# constants
+
+####
+# functions
+
+function msg() {
+	echo -e "$*"
+}
+
+function notice() {
+	msg ">>> $*"
+}
+
+function warning() {
+	if [[ -z $* ]]; then
+		msg "*** WARNING: unknown error occurred"
+	else
+		msg "*** WARNING:" "$*"
+	fi
+}
+
+function exit_error() {
+	if [[ -z $* ]]; then
+		msg "*** ERROR: unknown error occurred"
+	else
+		msg "*** ERROR:" "$*"
+	fi
+	exit 1
+}
+
+function verify_deps() {
+	[[ -z "$1" ]] && return
+	if ! which "$1" >& /dev/null; then
+		exit_error "install \"$1\" and include it in your \$PATH"
+	fi
+}
+
+function lopt_name() {
+	echo "$1" | sed 's/--\(.*\)=\(.*\)/\1/'
+}
+
+function lopt_value() {
+	echo "$1" | sed 's/--\(.*\)=\(.*\)/\2/'
+}
+
+function editor() {
+	if [[ -n $PJOB_EDITOR && -x $PJOB_EDITOR ]]; then
+		$PJOB_EDITOR $*
+		return $?
+	elif [[ -n $EDITOR && -x $EDITOR ]]; then
+		$EDITOR $*
+		return $?
+	elif [[ -x $(which vim 2> /dev/null) ]]; then
+		vim $*
+		return $?
+	elif [[ -x $(which vi 2> /dev/null) ]]; then
+		vi $*
+		return $?
+	elif [[ -x $(which nano 2> /dev/null) ]]; then
+		nano $*
+		return $?
+	fi
+
+	return 1
+}
+
+####
+# dependencies
+
+# kate: syntax bash;

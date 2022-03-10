@@ -1,0 +1,60 @@
+#!/bin/bash
+
+#
+# PJOB chroot script
+# Paul Moore <paul@paul-moore.com>
+#
+# (c) Copyright Paul Moore, 2022
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# NOTE: the pjob-chroot and pjob-chroot-kill scripts must be kept in sync
+
+_INCL_BASE=$(dirname $(echo $0 | sed -e 's,\(^[^\/]\),'"$(pwd)"'/\1,'))
+
+####
+# configuration
+
+. $_INCL_BASE/pjob.config
+
+####
+# pjob libraries
+
+. $_INCL_BASE/pjob-generic-functions
+
+####
+# functions
+
+function exit_usage() {
+	msg "$0: ..."
+	exit 1
+}
+
+####
+# main
+
+[[ -z $1 ]] && exit_usage
+
+# find the unshare process
+l1=$(pgrep -P $1)
+[[ $? -ne 0 ]] && exit 1
+l2=$(pgrep -P $l1)
+[[ $? -ne 0 ]] && exit 1
+
+# kill the job's parent unshare process
+sudo kill $l2
+
+exit 0
+
+# kate: syntax bash;
